@@ -6,6 +6,8 @@ import time
 import logging
 import tempfile
 from typing import Dict, List
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 
@@ -23,10 +25,14 @@ logger = logging.getLogger(__name__)
 ##########################################
 # WATSONX CONFIG (UNCHANGED)
 ##########################################
-API_KEY = "9dhWazh67-KWTUjf80FnPsmEUx828u1vid3PNrFAmuSS"
-SERVICE_URL = "https://us-south.ml.cloud.ibm.com/"
-PROJECT_ID = "52cf4e44-2a8c-474d-b247-11957cc6891d"
-MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct-fp8"
+API_KEY = os.getenv("IBM_API_KEY")
+SERVICE_URL = os.getenv("IBM_SERVICE_URL")
+PROJECT_ID = os.getenv("IBM_PROJECT_ID")
+MODEL_ID = os.getenv("IBM_MODEL_ID")
+
+# Optional: check if all variables are set
+if not all([API_KEY, SERVICE_URL, PROJECT_ID, MODEL_ID]):
+    raise RuntimeError("One or more IBM Watsonx environment variables are missing!")
 
 creds = Credentials(url=SERVICE_URL, api_key=API_KEY)
 api_client = APIClient(creds)
