@@ -6,27 +6,50 @@ import time
 import logging
 import tempfile
 from typing import Dict, List
-
-from fastapi import FastAPI, HTTPException, UploadFile, File
-
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 from ibm_watsonx_ai import Credentials, APIClient
 from ibm_watsonx_ai.foundation_models import ModelInference
-
 from image_processor2 import enhance_image_for_ocr
+from dotenv import load_dotenv
+load_dotenv()
 
 ##########################################
 # LOGGING
 ##########################################
-logging.basicConfig(level=logging.INFO)
+log_dir = os.path.join("logs", "invoice_api")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "invoice_api.log")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler(log_file),   # Write to file
+        logging.StreamHandler()          # Also print to console
+    ]
+)
 logger = logging.getLogger(__name__)
+##########################################
+# API KEY AUTHENTICATION
+##########################################
+# Valid API keys for authentication
+VALID_API_KEYS = {
+    "a7f3c2e9b1d4567890abcdef1234567890abcd": "Mobile App Client",
+    # Add more keys as needed for different clients
+}
 
 ##########################################
 # WATSONX CONFIG (UNCHANGED)
 ##########################################
-API_KEY = "9dhWazh67-KWTUjf80FnPsmEUx828u1vid3PNrFAmuSS"
-SERVICE_URL = "https://us-south.ml.cloud.ibm.com/"
-PROJECT_ID = "52cf4e44-2a8c-474d-b247-11957cc6891d"
-MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct-fp8"
+API_KEY = os.getenv("IBM_API_KEY")
+SERVICE_URL = os.getenv("IBM_SERVICE_URL")
+PROJECT_ID = os.getenv("IBM_PROJECT_ID")
+MODEL_ID = os.getenv("IBM_MODEL_ID")
+
+# Optional: check if all variables are set
+if not all([API_KEY, SERVICE_URL, PROJECT_ID, MODEL_ID]):
+    raise RuntimeError("One or more IBM Watsonx environment variables are missing!")
 
 creds = Credentials(url=SERVICE_URL, api_key=API_KEY)
 api_client = APIClient(creds)
@@ -408,6 +431,32 @@ Before returning JSON, verify:
 app = FastAPI(title="Invoice Extraction API")
 
 ##########################################
+# NEW ENDPOINTS - ROOT AND HEALTH CHECK
+##########################################
+@app.get("/")
+async def root():
+    """Root endpoint - API information"""
+    return {
+        "service": "Invoice Extraction API",
+        "version": "1.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "extract": "/extract-invoice",
+            "docs": "/docs"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "healthy",
+        "service": "invoice-extraction",
+        "watson_configured": True
+    }
+
+##########################################
 # ROBUST JSON PARSER
 ##########################################
 def parse_json_robust(raw_text: str) -> Dict:
@@ -449,11 +498,29 @@ def extract_invoice_from_path(image_path: str) -> Dict:
             time.sleep(2 ** attempt)
 
 ##########################################
-# API ENDPOINT (UPLOAD FILE VIA FORM-DATA)
+# API ENDPOINT WITH API KEY AUTHENTICATION
 ##########################################
 @app.post("/extract-invoice")
-async def extract_invoice_api(files: List[UploadFile] = File(...)):
+async def extract_invoice_api(
+    files: List[UploadFile] = File(...),
+    x_api_key: str = Header(None, description="API Key for authentication")
+):
+    # Initialize results list
     results = []
+
+    # API Key Validation
+    if not x_api_key or x_api_key not in VALID_API_KEYS:
+        logger.warning(f"Unauthorized access attempt with key: {x_api_key}")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "Unauthorized",
+                "message": "Invalid or missing API key",
+                "status": 401
+            }
+        )
+
+    logger.info(f"Authorized request from: {VALID_API_KEYS[x_api_key]}, files: {[file.filename for file in files]}")
 
     try:
         for file in files:
@@ -469,9 +536,11 @@ async def extract_invoice_api(files: List[UploadFile] = File(...)):
 
             # Image preprocessing
             enhance_image_for_ocr(temp_path)
+            logger.info(f"Image preprocessing done for {file.filename}")
 
             # Extract invoice
             extracted_data = extract_invoice_from_path(temp_path)
+            logger.info(f"Invoice extraction success for {file.filename}")
 
             os.remove(temp_path)
 
@@ -480,6 +549,7 @@ async def extract_invoice_api(files: List[UploadFile] = File(...)):
                 "data": extracted_data
             })
 
+        logger.info(f"Extraction completed for {len(results)} files")
         return {
             "status": "success",
             "count": len(results),
@@ -487,5 +557,5 @@ async def extract_invoice_api(files: List[UploadFile] = File(...)):
         }
 
     except Exception as e:
-        logger.exception("Invoice extraction failed")
+        logger.exception(f"Invoice extraction failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
