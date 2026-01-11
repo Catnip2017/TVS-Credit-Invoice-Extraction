@@ -6,21 +6,27 @@ import time
 import logging
 import tempfile
 from typing import Dict, List
-from dotenv import load_dotenv
-load_dotenv()
-
-from fastapi import FastAPI, HTTPException, UploadFile, File
-
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 from ibm_watsonx_ai import Credentials, APIClient
 from ibm_watsonx_ai.foundation_models import ModelInference
-
 from image_processor2 import enhance_image_for_ocr
+from dotenv import load_dotenv
+load_dotenv()
 
 ##########################################
 # LOGGING
 ##########################################
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+##########################################
+# API KEY AUTHENTICATION
+##########################################
+# Valid API keys for authentication
+VALID_API_KEYS = {
+    "a7f3c2e9b1d4567890abcdef1234567890abcd": "Mobile App Client",
+    # Add more keys as needed for different clients
+}
 
 ##########################################
 # WATSONX CONFIG (UNCHANGED)
@@ -414,6 +420,32 @@ Before returning JSON, verify:
 app = FastAPI(title="Invoice Extraction API")
 
 ##########################################
+# NEW ENDPOINTS - ROOT AND HEALTH CHECK
+##########################################
+@app.get("/")
+async def root():
+    """Root endpoint - API information"""
+    return {
+        "service": "Invoice Extraction API",
+        "version": "1.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "extract": "/extract-invoice",
+            "docs": "/docs"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "healthy",
+        "service": "invoice-extraction",
+        "watson_configured": True
+    }
+
+##########################################
 # ROBUST JSON PARSER
 ##########################################
 def parse_json_robust(raw_text: str) -> Dict:
@@ -455,10 +487,28 @@ def extract_invoice_from_path(image_path: str) -> Dict:
             time.sleep(2 ** attempt)
 
 ##########################################
-# API ENDPOINT (UPLOAD FILE VIA FORM-DATA)
+# API ENDPOINT WITH API KEY AUTHENTICATION
 ##########################################
 @app.post("/extract-invoice")
-async def extract_invoice_api(files: List[UploadFile] = File(...)):
+async def extract_invoice_api(
+    files: List[UploadFile] = File(...),
+    x_api_key: str = Header(None, description="API Key for authentication")
+):
+    # API Key Validation
+    if not x_api_key or x_api_key not in VALID_API_KEYS:
+        logger.warning(f"Unauthorized access attempt with key: {x_api_key}")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "Unauthorized",
+                "message": "Invalid or missing API key",
+                "status": 401
+            }
+        )
+    
+    logger.info(f"Authorized request from: {VALID_API_KEYS[x_api_key]}")
+    
+    # Original extraction logic
     results = []
 
     try:
