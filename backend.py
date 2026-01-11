@@ -40,6 +40,15 @@ VALID_API_KEYS = {
 }
 
 ##########################################
+# API KEY AUTHENTICATION
+##########################################
+# Valid API keys for authentication
+VALID_API_KEYS = {
+    "a7f3c2e9b1d4567890abcdef1234567890abcd": "Mobile App Client",
+    # Add more keys as needed for different clients
+}
+
+##########################################
 # WATSONX CONFIG (UNCHANGED)
 ##########################################
 API_KEY = os.getenv("IBM_API_KEY")
@@ -505,7 +514,25 @@ async def extract_invoice_api(
     files: List[UploadFile] = File(...),
     x_api_key: str = Header(None, description="API Key for authentication")
 ):
+<<<<<<< HEAD
     # Initialize results list
+=======
+    # API Key Validation
+    if not x_api_key or x_api_key not in VALID_API_KEYS:
+        logger.warning(f"Unauthorized access attempt with key: {x_api_key}")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "Unauthorized",
+                "message": "Invalid or missing API key",
+                "status": 401
+            }
+        )
+    
+    logger.info(f"Authorized request from: {VALID_API_KEYS[x_api_key]}")
+    
+    # Original extraction logic
+>>>>>>> c628554b776bfe5202b136421534bc72c7037a2f
     results = []
 
     # API Key Validation
