@@ -437,7 +437,7 @@ Before returning JSON, verify:
 ##########################################
 # FASTAPI SETUP
 ##########################################
-app = FastAPI(title="Invoice Extraction API")
+app = FastAPI(title="Invoice Extraction API",docs_url=None,redoc_url=None,openapi_url=None)
 
 ##########################################
 # NEW ENDPOINTS - ROOT AND HEALTH CHECK
@@ -514,9 +514,7 @@ async def extract_invoice_api(
     files: List[UploadFile] = File(...),
     x_api_key: str = Header(None, description="API Key for authentication")
 ):
-<<<<<<< HEAD
-    # Initialize results list
-=======
+
     # API Key Validation
     if not x_api_key or x_api_key not in VALID_API_KEYS:
         logger.warning(f"Unauthorized access attempt with key: {x_api_key}")
@@ -532,7 +530,6 @@ async def extract_invoice_api(
     logger.info(f"Authorized request from: {VALID_API_KEYS[x_api_key]}")
     
     # Original extraction logic
->>>>>>> c628554b776bfe5202b136421534bc72c7037a2f
     results = []
 
     # API Key Validation
