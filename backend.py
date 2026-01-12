@@ -478,6 +478,78 @@ def parse_json_robust(raw_text: str) -> Dict:
             return json.loads(cleaned[start:end + 1])
     return {}
 
+
+##########################################
+# EXTRACTION FIELD ANALYSIS FOR LOGGING
+##########################################
+
+EXPECTED_TOP_LEVEL_FIELDS = [
+    "invoiceNumber",
+    "invoiceNumberType",
+    "invoiceDate",
+    "DealerName",
+    "DealerPhone",
+    "DealerAddress",
+    "EMIAmount",
+    "gstNumber",
+    "customerName",
+    "customerPhone",
+    "customerAddress",
+    "downPayment",
+    "netTotal",
+    "stampPresent",
+    "informationInStamp",
+    "signaturePresent",
+    "hypothecationStamp",
+    "stampCompanyMatching_score",
+]
+
+EXPECTED_ITEM_FIELDS = [
+    "itemNo",
+    "Asset Model No",
+    "brandName",
+    "imeiNumber",
+    "serialNumber",
+    "quantity",
+    "rate",
+    "sgst",
+    "cgst",
+    "igst",
+    "tax",
+    "itemAmount",
+]
+def analyze_extracted_fields(extracted_data: Dict):
+    extracted_fields = []
+    not_extracted_fields = []
+
+    def has_value(val):
+        return val not in [None, "", [], {}]
+
+    # ---- TOP LEVEL ----
+    for field in EXPECTED_TOP_LEVEL_FIELDS:
+        if has_value(extracted_data.get(field)):
+            extracted_fields.append(field)
+        else:
+            not_extracted_fields.append(field)
+
+    # ---- ITEMS ----
+    items = extracted_data.get("items", [])
+
+    if isinstance(items, list) and items:
+        for idx, item in enumerate(items, start=1):
+            for field in EXPECTED_ITEM_FIELDS:
+                field_name = f"items[{idx}].{field}"
+                if has_value(item.get(field)):
+                    extracted_fields.append(field_name)
+                else:
+                    not_extracted_fields.append(field_name)
+    else:
+        # No items extracted at all
+        for field in EXPECTED_ITEM_FIELDS:
+            not_extracted_fields.append(f"items[1].{field}")
+
+    return extracted_fields, not_extracted_fields
+
 ##########################################
 # CORE EXTRACTION
 ##########################################
@@ -564,7 +636,23 @@ async def extract_invoice_api(
 
             # Extract invoice
             extracted_data = extract_invoice_from_path(temp_path)
+            logger.info(f"[{file.filename}] Raw extracted_data keys: {list(extracted_data.keys())}")
+
+            # Analyze extracted vs not extracted fields
+            extracted_fields, not_extracted_fields = analyze_extracted_fields(extracted_data)
+
             logger.info(f"Invoice extraction success for {file.filename}")
+
+            logger.info(
+                f"[{file.filename}] Extracted Fields ({len(extracted_fields)}): "
+                f"{', '.join(extracted_fields)}"
+            )
+
+            logger.info(
+                f"[{file.filename}] Not Extracted Fields ({len(not_extracted_fields)}): "
+                f"{', '.join(not_extracted_fields)}"
+            )
+
 
             os.remove(temp_path)
 
