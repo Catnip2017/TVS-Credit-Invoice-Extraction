@@ -6,57 +6,71 @@ import time
 import logging
 import tempfile
 from typing import Dict, List
-from fastapi import FastAPI, HTTPException, UploadFile, File, Header
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Request
+from fastapi.responses import Response
 from ibm_watsonx_ai import Credentials, APIClient
 from ibm_watsonx_ai.foundation_models import ModelInference
 from image_processor2 import enhance_image_for_ocr
 from dotenv import load_dotenv
+
 load_dotenv()
 
 ##########################################
-# LOGGING
+# LOGGING SETUP
 ##########################################
 log_dir = os.path.join("logs", "invoice_api")
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, "invoice_api.log")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[
-        logging.FileHandler(log_file),   # Write to file
-        logging.StreamHandler()          # Also print to console
-    ]
+main_log_file = os.path.join(log_dir, "invoice_api.log")
+success_log_file = os.path.join(log_dir, "success.log")
+error_log_file = os.path.join(log_dir, "error.log")
+
+# Base logger
+logger = logging.getLogger("invoice_api")
+logger.setLevel(logging.INFO)
+
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-logger = logging.getLogger(__name__)
-##########################################
-# API KEY AUTHENTICATION
-##########################################
-# Valid API keys for authentication
-VALID_API_KEYS = {
-    "a7f3c2e9b1d4567890abcdef1234567890abcd": "Mobile App Client",
-    # Add more keys as needed for different clients
-}
+
+# Main log (everything)
+main_handler = logging.FileHandler(main_log_file)
+main_handler.setFormatter(formatter)
+
+# Success log
+success_handler = logging.FileHandler(success_log_file)
+success_handler.setLevel(logging.INFO)
+success_handler.setFormatter(formatter)
+
+# Error log
+error_handler = logging.FileHandler(error_log_file)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(formatter)
+
+# Console log
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+
+logger.addHandler(main_handler)
+logger.addHandler(success_handler)
+logger.addHandler(error_handler)
+logger.addHandler(console_handler)
 
 ##########################################
 # API KEY AUTHENTICATION
 ##########################################
-# Valid API keys for authentication
 VALID_API_KEYS = {
     "a7f3c2e9b1d4567890abcdef1234567890abcd": "Mobile App Client",
-    # Add more keys as needed for different clients
 }
 
 ##########################################
-# WATSONX CONFIG (UNCHANGED)
+# WATSONX CONFIG
 ##########################################
 API_KEY = os.getenv("IBM_API_KEY")
 SERVICE_URL = os.getenv("IBM_SERVICE_URL")
 PROJECT_ID = os.getenv("IBM_PROJECT_ID")
 MODEL_ID = os.getenv("IBM_MODEL_ID")
 
-# Optional: check if all variables are set
 if not all([API_KEY, SERVICE_URL, PROJECT_ID, MODEL_ID]):
     raise RuntimeError("One or more IBM Watsonx environment variables are missing!")
 
@@ -64,10 +78,7 @@ creds = Credentials(url=SERVICE_URL, api_key=API_KEY)
 api_client = APIClient(creds)
 api_client.set.default_project(PROJECT_ID)
 
-model = ModelInference(
-    api_client=api_client,
-    model_id=MODEL_ID
-)
+model = ModelInference(api_client=api_client, model_id=MODEL_ID)
 
 generation_params = {
     "max_new_tokens": 12000,
@@ -75,6 +86,7 @@ generation_params = {
     "top_p": 0.95,
     "repetition_penalty": 1.15
 }
+
 
 invoice_prompt = """
 You are an expert OCR-based invoice data extractor with 99% accuracy requirement.
@@ -437,33 +449,62 @@ Before returning JSON, verify:
 ##########################################
 # FASTAPI SETUP
 ##########################################
-app = FastAPI(title="Invoice Extraction API",docs_url=None,redoc_url=None,openapi_url=None)
+app = FastAPI(
+    title="Invoice Extraction API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
 
 ##########################################
-# NEW ENDPOINTS - ROOT AND HEALTH CHECK
+# REQUEST LOGGING MIDDLEWARE (HTTPS REQUESTS)
+##########################################
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+
+    client_ip = request.client.host if request.client else "unknown"
+    method = request.method
+    url = str(request.url)
+    headers = dict(request.headers)
+
+    logger.info(
+        f"Incoming Request | IP={client_ip} | Method={method} | URL={url} | Headers={headers}"
+    )
+
+    try:
+        response: Response = await call_next(request)
+        duration = round(time.time() - start_time, 3)
+
+        logger.info(
+            f"Request Completed | IP={client_ip} | Method={method} | URL={url} "
+            f"| Status={response.status_code} | Time={duration}s"
+        )
+        return response
+
+    except Exception as e:
+        duration = round(time.time() - start_time, 3)
+        logger.error(
+            f"Request Failed | IP={client_ip} | Method={method} | URL={url} "
+            f"| Error={str(e)} | Time={duration}s",
+            exc_info=True
+        )
+        raise
+
+##########################################
+# ROOT & HEALTH
 ##########################################
 @app.get("/")
 async def root():
-    """Root endpoint - API information"""
     return {
         "service": "Invoice Extraction API",
         "version": "1.0",
-        "status": "running",
-        "endpoints": {
-            "health": "/health",
-            "extract": "/extract-invoice",
-            "docs": "/docs"
-        }
+        "status": "running"
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for monitoring"""
-    return {
-        "status": "healthy",
-        "service": "invoice-extraction",
-        "watson_configured": True
-    }
+    return {"status": "healthy"}
 
 ##########################################
 # ROBUST JSON PARSER
@@ -480,75 +521,53 @@ def parse_json_robust(raw_text: str) -> Dict:
 
 
 ##########################################
-# EXTRACTION FIELD ANALYSIS FOR LOGGING
+# EXTRACTION AUDIT (HEADER + ITEMS)
 ##########################################
+def audit_extracted_fields(data: Dict):
+    header_extracted = []
+    header_missing = []
 
-EXPECTED_TOP_LEVEL_FIELDS = [
-    "invoiceNumber",
-    "invoiceNumberType",
-    "invoiceDate",
-    "DealerName",
-    "DealerPhone",
-    "DealerAddress",
-    "EMIAmount",
-    "gstNumber",
-    "customerName",
-    "customerPhone",
-    "customerAddress",
-    "downPayment",
-    "netTotal",
-    "stampPresent",
-    "informationInStamp",
-    "signaturePresent",
-    "hypothecationStamp",
-    "stampCompanyMatching_score",
-]
+    # -------- HEADER LEVEL --------
+    for key, value in data.items():
+        if key == "items":
+            continue
 
-EXPECTED_ITEM_FIELDS = [
-    "itemNo",
-    "Asset Model No",
-    "brandName",
-    "imeiNumber",
-    "serialNumber",
-    "quantity",
-    "rate",
-    "sgst",
-    "cgst",
-    "igst",
-    "tax",
-    "itemAmount",
-]
-def analyze_extracted_fields(extracted_data: Dict):
-    extracted_fields = []
-    not_extracted_fields = []
-
-    def has_value(val):
-        return val not in [None, "", [], {}]
-
-    # ---- TOP LEVEL ----
-    for field in EXPECTED_TOP_LEVEL_FIELDS:
-        if has_value(extracted_data.get(field)):
-            extracted_fields.append(field)
+        if value not in ("", None, [], {}):
+            header_extracted.append(key)
         else:
-            not_extracted_fields.append(field)
+            header_missing.append(key)
 
-    # ---- ITEMS ----
-    items = extracted_data.get("items", [])
+    # -------- ITEM LEVEL --------
+    items = data.get("items", [])
+    item_audit = []
 
-    if isinstance(items, list) and items:
-        for idx, item in enumerate(items, start=1):
-            for field in EXPECTED_ITEM_FIELDS:
-                field_name = f"items[{idx}].{field}"
-                if has_value(item.get(field)):
-                    extracted_fields.append(field_name)
-                else:
-                    not_extracted_fields.append(field_name)
-    else:
-        # No items extracted at all
-        for field in EXPECTED_ITEM_FIELDS:
-            not_extracted_fields.append(f"items[1].{field}")
+    for idx, item in enumerate(items, start=1):
+        extracted_fields = []
+        missing_fields = []
 
-    return extracted_fields, not_extracted_fields
+        for field, value in item.items():
+            if value not in ("", None):
+                extracted_fields.append(field)
+            else:
+                missing_fields.append(field)
+
+        item_audit.append({
+            "item_no": idx,
+            "extracted_fields": extracted_fields,
+            "missing_fields": missing_fields
+        })
+
+    return {
+        "header": {
+            "extracted": header_extracted,
+            "missing": header_missing
+        },
+        "items": {
+            "count": len(items),
+            "details": item_audit
+        }
+    }
+
 
 ##########################################
 # CORE EXTRACTION
@@ -557,7 +576,7 @@ def extract_invoice_from_path(image_path: str) -> Dict:
     with open(image_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode()
 
-    mime = "image/jpeg" if image_path.lower().endswith(("jpg", "jpeg",)) else "image/png"
+    mime = "image/jpeg" if image_path.lower().endswith(("jpg", "jpeg")) else "image/png"
     data_url = f"data:{mime};base64,{img_b64}"
 
     messages = [{
@@ -574,100 +593,63 @@ def extract_invoice_from_path(image_path: str) -> Dict:
             raw = response["choices"][0]["message"]["content"]
             return parse_json_robust(raw)
         except Exception as e:
+            logger.error(f"OCR attempt {attempt+1} failed: {str(e)}")
             if attempt == 2:
                 raise
             time.sleep(2 ** attempt)
 
 ##########################################
-# API ENDPOINT WITH API KEY AUTHENTICATION
+# API ENDPOINT
 ##########################################
 @app.post("/extract-invoice")
 async def extract_invoice_api(
     files: List[UploadFile] = File(...),
-    x_api_key: str = Header(None, description="API Key for authentication")
+    x_api_key: str = Header(None)
 ):
-
-    # API Key Validation
     if not x_api_key or x_api_key not in VALID_API_KEYS:
-        logger.warning(f"Unauthorized access attempt with key: {x_api_key}")
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error": "Unauthorized",
-                "message": "Invalid or missing API key",
-                "status": 401
-            }
-        )
-    
-    logger.info(f"Authorized request from: {VALID_API_KEYS[x_api_key]}")
-    
-    # Original extraction logic
+        logger.error(f"Unauthorized API Key attempt: {x_api_key}")
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    logger.info(f"Authorized Client: {VALID_API_KEYS[x_api_key]}")
+
     results = []
-
-    # API Key Validation
-    if not x_api_key or x_api_key not in VALID_API_KEYS:
-        logger.warning(f"Unauthorized access attempt with key: {x_api_key}")
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error": "Unauthorized",
-                "message": "Invalid or missing API key",
-                "status": 401
-            }
-        )
-
-    logger.info(f"Authorized request from: {VALID_API_KEYS[x_api_key]}, files: {[file.filename for file in files]}")
 
     try:
         for file in files:
-            tmp = tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=os.path.splitext(file.filename)[1]
-            )
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
             tmp.write(await file.read())
-            tmp.flush()
             tmp.close()
 
-            temp_path = tmp.name
+            enhance_image_for_ocr(tmp.name)
+            logger.info(f"OCR preprocessing successful for {file.filename}")
 
-            # Image preprocessing
-            enhance_image_for_ocr(temp_path)
-            logger.info(f"Image preprocessing done for {file.filename}")
-
-            # Extract invoice
-            extracted_data = extract_invoice_from_path(temp_path)
-            logger.info(f"[{file.filename}] Raw extracted_data keys: {list(extracted_data.keys())}")
-
-            # Analyze extracted vs not extracted fields
-            extracted_fields, not_extracted_fields = analyze_extracted_fields(extracted_data)
-
-            logger.info(f"Invoice extraction success for {file.filename}")
-
+            extracted_data = extract_invoice_from_path(tmp.name)
+            audit = audit_extracted_fields(extracted_data)
             logger.info(
-                f"[{file.filename}] Extracted Fields ({len(extracted_fields)}): "
-                f"{', '.join(extracted_fields)}"
+
+                f"SUCCESS AUDIT | File={file.filename} | "
+                f"HeaderExtracted={audit['header']['extracted']} | "
+                f"HeaderMissing={audit['header']['missing']} | "
+                f"ItemCount={audit['items']['count']}"
             )
+            # Item-level logging
+            for item in audit["items"]["details"]:
+                logger.info(
+                    f"ITEM AUDIT | File={file.filename} | "
+                    f"ItemNo={item['item_no']} | "
+                    f"ExtractedFields={item['extracted_fields']} | "
+                    f"MissingFields={item['missing_fields']}"
+                )
 
-            logger.info(
-                f"[{file.filename}] Not Extracted Fields ({len(not_extracted_fields)}): "
-                f"{', '.join(not_extracted_fields)}"
-            )
+            os.remove(tmp.name)
 
+            results.append({"filename": file.filename, "data": extracted_data})
 
-            os.remove(temp_path)
+            logger.info(f"Invoice extraction SUCCESS for {file.filename}")
 
-            results.append({
-                "filename": file.filename,
-                "data": extracted_data
-            })
-
-        logger.info(f"Extraction completed for {len(results)} files")
-        return {
-            "status": "success",
-            "count": len(results),
-            "results": results
-        }
+        logger.info(f"SUCCESS: Extracted {len(results)} invoice(s)")
+        return {"status": "success", "count": len(results), "results": results}
 
     except Exception as e:
-        logger.exception(f"Invoice extraction failed: {str(e)}")
+        logger.error("Invoice extraction FAILED", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
