@@ -1,4 +1,3 @@
-import uuid
 import os
 import re
 import json
@@ -6,9 +5,6 @@ import base64
 import time
 import logging
 import tempfile
-from datetime import datetime
-import time
-from fastapi import Request
 from typing import Dict, List
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Request
 from fastapi.responses import Response
@@ -19,72 +15,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import psycopg2
-from psycopg2.extras import Json
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "port": os.getenv("DB_PORT", 5432),
-    "dbname": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-}
+import uuid
+from datetime import datetime
 
-def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
+def generate_job_id() -> str:
+    date_part = datetime.now().strftime("%Y-%m-%d")
+    random_part = uuid.uuid4().hex[:10]  # exactly 10 characters
+    return f"{date_part}-{random_part}"
 
-
-def insert_log(job_id, client_ip, api_client, filename, items_extracted, status, duration):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO logs (
-            job_id, client_ip, api_client, filename,
-            items_extracted, status, duration_sec
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """, (
-        job_id, client_ip, api_client, filename,
-        items_extracted, status, duration
-    ))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def insert_document_data(job_id, filename, extracted_data, api_key):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO document_data (
-            job_id, filename, extracted_data, api_key, status
-        ) VALUES (%s, %s, %s, %s, 'Processing')
-    """, (
-        job_id,
-        filename,
-        Json(extracted_data),
-        api_key
-    ))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def update_document_status(job_id, filename, status):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        UPDATE document_data
-        SET status = %s
-        WHERE job_id = %s AND filename = %s
-    """, (status, job_id, filename))
-
-    conn.commit()
-    cur.close()
-    conn.close()
 
 ##########################################
 # LOGGING SETUP
@@ -515,59 +453,6 @@ Before returning JSON, verify:
 - [ ] For multi-line invoices: Rate and Amount columns identified correctly
 - [ ] Rate is unit price, Amount is line total
 - [ ] All "" for missing values (no null, no "N/A")
-
-
-═══════════════════════════════════════════════════════════════
-🧩 ADDITIONAL FIELD EXTRACTION (DYNAMIC KEY–VALUE PAIRS)
-═══════════════════════════════════════════════════════════════
-
-Objective:
-Extract ALL other clearly visible information from the invoice that does NOT fit into the predefined fields, and return them as structured key–value pairs.
-🔴 EXTRACTION RULES (STRICT)
-VISIBILITY ONLY
-Extract ONLY text that is clearly readable on the invoice
-If unsure → return "" (do NOT guess)
-NO DUPLICATION
-Do NOT repeat values already extracted in predefined fields
-Example:
-GSTIN already in gstNumber → do NOT repeat it again
-KEY NAMING RULES
-Keys must be:
-Meaningful
-Human-readable
-CamelCase
-Examples:
-"paymentMode"
-"invoiceType"
-"vehicleNumber"
-"engineNumber"
-"chassisNumber"
-"ewayBillNumber"
-"loanAccountNumber"
-"financeCompany"
-"bankName"
-"accountNumber"
-"ifscCode"
-"placeOfSupply"
-"stateCode"
-"deliveryDate"
-"dueDate"
-"salesPersonName"
-"referenceNumber"
-VALUE RULES
-Preserve exact formatting as printed
-Do NOT normalize dates, numbers, or text
-Extract full text for multi-line values as a single string
-HANDWRITTEN TEXT
-If handwritten and readable → extract
-If unclear → return ""
-TABLE-INDEPENDENT
-These fields may appear:
-In header
-Side notes
-Footer
-Stamp
-Free-text areas
 """
 
 ##########################################
@@ -584,16 +469,36 @@ app = FastAPI(
 # REQUEST LOGGING MIDDLEWARE (HTTPS REQUESTS)
 ##########################################
 @app.middleware("http")
-async def job_context(request: Request, call_next):
+async def log_requests(request: Request, call_next):
     start_time = time.time()
-    job_id = f"{datetime.utcnow().strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:10]}"
-    request.state.job_id = job_id
-    request.state.start_time = start_time
 
-    response = await call_next(request)
+    client_ip = request.client.host if request.client else "unknown"
+    method = request.method
+    url = str(request.url)
+    headers = dict(request.headers)
 
-    response.headers["X-Job-Id"] = job_id
-    return response
+    logger.info(
+        f"Incoming Request | IP={client_ip} | Method={method} | URL={url} | Headers={headers}"
+    )
+
+    try:
+        response: Response = await call_next(request)
+        duration = round(time.time() - start_time, 3)
+
+        logger.info(
+            f"Request Completed | IP={client_ip} | Method={method} | URL={url} "
+            f"| Status={response.status_code} | Time={duration}s"
+        )
+        return response
+
+    except Exception as e:
+        duration = round(time.time() - start_time, 3)
+        logger.error(
+            f"Request Failed | IP={client_ip} | Method={method} | URL={url} "
+            f"| Error={str(e)} | Time={duration}s",
+            exc_info=True
+        )
+        raise
 
 ##########################################
 # ROOT & HEALTH
@@ -707,30 +612,20 @@ def extract_invoice_from_path(image_path: str) -> Dict:
 ##########################################
 @app.post("/extract-invoice")
 async def extract_invoice_api(
-    request: Request,
     files: List[UploadFile] = File(...),
     x_api_key: str = Header(None)
 ):
-    job_id = request.state.job_id
-    start_time = request.state.start_time
-    client_ip = request.client.host if request.client else "unknown"
-
     if not x_api_key or x_api_key not in VALID_API_KEYS:
+        logger.error(f"Unauthorized API Key attempt: {x_api_key}")
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    api_client = VALID_API_KEYS[x_api_key]
-    response_payload = []
+    job_id = generate_job_id()
+    logger.info(f"Job Started | JobID={job_id} | Client={VALID_API_KEYS[x_api_key]}")
+
+    results = []
 
     try:
         for file in files:
-            # 🔹 1️⃣ INSERT ROW IMMEDIATELY (Processing)
-            insert_document_data(
-                job_id=job_id,
-                filename=file.filename,
-                extracted_data={},      # empty initially
-                api_key=x_api_key
-            )
-
             tmp = tempfile.NamedTemporaryFile(
                 delete=False,
                 suffix=os.path.splitext(file.filename)[1]
@@ -738,68 +633,50 @@ async def extract_invoice_api(
             tmp.write(await file.read())
             tmp.close()
 
-            try:
-                enhance_image_for_ocr(tmp.name)
+            enhance_image_for_ocr(tmp.name)
+            logger.info(
+                f"OCR preprocessing successful | JobID={job_id} | File={file.filename}"
+            )
 
-                extracted_data = extract_invoice_from_path(tmp.name)
-                items_count = len(extracted_data.get("items", []))
+            extracted_data = extract_invoice_from_path(tmp.name)
+            audit = audit_extracted_fields(extracted_data)
 
-                # 🔹 2️⃣ UPDATE JSON + STATUS = Success
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE document_data
-                    SET extracted_data = %s, status = 'Success'
-                    WHERE job_id = %s AND filename = %s
-                """, (Json(extracted_data), job_id, file.filename))
-                conn.commit()
-                cur.close()
-                conn.close()
+            logger.info(
+                f"SUCCESS AUDIT | JobID={job_id} | File={file.filename} | "
+                f"HeaderExtracted={audit['header']['extracted']} | "
+                f"HeaderMissing={audit['header']['missing']} | "
+                f"ItemCount={audit['items']['count']}"
+            )
 
-                # 🔹 3️⃣ LOG SUCCESS
-                duration = round(time.time() - start_time, 3)
-                insert_log(
-                    job_id=job_id,
-                    client_ip=client_ip,
-                    api_client=api_client,
-                    filename=file.filename,
-                    items_extracted=items_count,
-                    status="SUCCESS",
-                    duration=duration
+            for item in audit["items"]["details"]:
+                logger.info(
+                    f"ITEM AUDIT | JobID={job_id} | File={file.filename} | "
+                    f"ItemNo={item['item_no']} | "
+                    f"ExtractedFields={item['extracted_fields']} | "
+                    f"MissingFields={item['missing_fields']}"
                 )
 
-                response_payload.append({
-                    "filename": file.filename,
-                    "items_extracted": items_count,
-                    "extracted_data": extracted_data
-                })
+            os.remove(tmp.name)
 
-            except Exception as file_error:
-                # 🔴 FILE-LEVEL FAILURE SAFE HANDLING
-                update_document_status(job_id, file.filename, "Fail")
+            results.append({
+                "filename": file.filename,
+                "data": extracted_data
+            })
 
-                duration = round(time.time() - start_time, 3)
-                insert_log(
-                    job_id=job_id,
-                    client_ip=client_ip,
-                    api_client=api_client,
-                    filename=file.filename,
-                    items_extracted=0,
-                    status="FAILED",
-                    duration=duration
-                )
-
-                raise file_error
-
-            finally:
-                if os.path.exists(tmp.name):
-                    os.remove(tmp.name)
+            logger.info(
+                f"Invoice extraction SUCCESS | JobID={job_id} | File={file.filename}"
+            )
 
         return {
-            "job_id": job_id,
-            "status": "SUCCESS",
-            "documents": response_payload
+            "jobId": job_id,
+            "status": "success",
+            "count": len(results),
+            "results": results
         }
 
     except Exception as e:
+        logger.error(
+            f"Invoice extraction FAILED | JobID={job_id}",
+            exc_info=True
+        )
         raise HTTPException(status_code=500, detail=str(e))
