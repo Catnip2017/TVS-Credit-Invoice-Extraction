@@ -1,7 +1,9 @@
 import uuid
+import threading 
 import os
 import re
 import json
+from psycopg2.extras import Json, RealDictCursor
 import base64
 import time
 import logging
@@ -10,6 +12,7 @@ from datetime import datetime
 import time
 from fastapi import Request
 from typing import Dict, List
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Request
 from fastapi.responses import Response
 from ibm_watsonx_ai import Credentials, APIClient
@@ -86,6 +89,58 @@ def update_document_status(job_id, filename, status):
     cur.close()
     conn.close()
 
+
+def background_invoice_processing(job_id: str, filename: str, tmp_path: str, x_api_key: str):
+    try:
+        enhance_image_for_ocr(tmp_path)
+        extracted_data = extract_invoice_from_path(tmp_path)
+        items_count = len(extracted_data.get("items", []))
+
+        # Update DB with extracted data and status Success
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE document_data
+            SET extracted_data = %s, status = 'Success'
+            WHERE job_id = %s AND filename = %s
+        """, (Json(extracted_data), job_id, filename))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # Log success
+        insert_log(
+            job_id=job_id,
+            client_ip="background",
+            api_client=VALID_API_KEYS[x_api_key],
+            filename=filename,
+            items_extracted=items_count,
+            status="SUCCESS",
+            duration=0
+        )
+
+    except Exception as e:
+        # Mark as failed if any exception
+        update_document_status(job_id, filename, "Fail")
+        insert_log(
+            job_id=job_id,
+            client_ip="background",
+            api_client=VALID_API_KEYS[x_api_key],
+            filename=filename,
+            items_extracted=0,
+            status="FAILED",
+            duration=0
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+##########################################
+# LOGGING SETUP
+##########################################
+log_dir = os.path.join("logs", "invoice_api")
+os.makedirs(log_dir, exist_ok=True)
 ##########################################
 # LOGGING SETUP
 ##########################################
@@ -712,94 +767,106 @@ async def extract_invoice_api(
     x_api_key: str = Header(None)
 ):
     job_id = request.state.job_id
-    start_time = request.state.start_time
     client_ip = request.client.host if request.client else "unknown"
 
     if not x_api_key or x_api_key not in VALID_API_KEYS:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    api_client = VALID_API_KEYS[x_api_key]
+    api_client_name = VALID_API_KEYS[x_api_key]
     response_payload = []
 
-    try:
-        for file in files:
-            # 🔹 1️⃣ INSERT ROW IMMEDIATELY (Processing)
-            insert_document_data(
-                job_id=job_id,
-                filename=file.filename,
-                extracted_data={},      # empty initially
-                api_key=x_api_key
-            )
+    for file in files:
+        # 1️⃣ Insert row immediately with empty data + Processing
+        insert_document_data(
+            job_id=job_id,
+            filename=file.filename,
+            extracted_data={},  # empty initially
+            api_key=x_api_key
+        )
 
-            tmp = tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=os.path.splitext(file.filename)[1]
-            )
-            tmp.write(await file.read())
-            tmp.close()
+        # 2️⃣ Save file temporarily
+        tmp_file = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=os.path.splitext(file.filename)[1]
+        )
+        tmp_file.write(await file.read())
+        tmp_file.close()
 
-            try:
-                enhance_image_for_ocr(tmp.name)
+        # 3️⃣ Start background thread for extraction
+        threading.Thread(
+            target=background_invoice_processing,
+            args=(job_id, file.filename, tmp_file.name, x_api_key),
+            daemon=True
+        ).start()
 
-                extracted_data = extract_invoice_from_path(tmp.name)
-                items_count = len(extracted_data.get("items", []))
+        # 4️⃣ Add file info to response
+        response_payload.append({
+            "filename": file.filename,
+            "status": "Processing"
+        })
 
-                # 🔹 2️⃣ UPDATE JSON + STATUS = Success
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE document_data
-                    SET extracted_data = %s, status = 'Success'
-                    WHERE job_id = %s AND filename = %s
-                """, (Json(extracted_data), job_id, file.filename))
-                conn.commit()
-                cur.close()
-                conn.close()
+    # 5️⃣ Immediate return with Job ID
+    return {
+        "job_id": job_id,
+        "status": "Processing",
+    }
 
-                # 🔹 3️⃣ LOG SUCCESS
-                duration = round(time.time() - start_time, 3)
-                insert_log(
-                    job_id=job_id,
-                    client_ip=client_ip,
-                    api_client=api_client,
-                    filename=file.filename,
-                    items_extracted=items_count,
-                    status="SUCCESS",
-                    duration=duration
-                )
-
-                response_payload.append({
-                    "filename": file.filename,
-                    "items_extracted": items_count,
-                    "extracted_data": extracted_data
-                })
-
-            except Exception as file_error:
-                # 🔴 FILE-LEVEL FAILURE SAFE HANDLING
-                update_document_status(job_id, file.filename, "Fail")
-
-                duration = round(time.time() - start_time, 3)
-                insert_log(
-                    job_id=job_id,
-                    client_ip=client_ip,
-                    api_client=api_client,
-                    filename=file.filename,
-                    items_extracted=0,
-                    status="FAILED",
-                    duration=duration
-                )
-
-                raise file_error
-
-            finally:
-                if os.path.exists(tmp.name):
-                    os.remove(tmp.name)
-
+##########################################
+# NEW: CHECK JOB STATUS ENDPOINT
+##########################################
+@app.get("/check-job/{job_id}")
+def check_job_status(
+    job_id: str,
+    x_api_key: str = Header(None)
+):
+    # 🔐 API key validation
+    if not x_api_key:
         return {
-            "job_id": job_id,
-            "status": "SUCCESS",
-            "documents": response_payload
+            "error": "API key is required"
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if x_api_key not in VALID_API_KEYS:
+        return {
+            "error": "Invalid API key"
+        }
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT filename, status, extracted_data
+        FROM document_data
+        WHERE job_id = %s
+    """, (job_id,))
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows:
+        return {
+            "jobId": job_id,
+            "status": "not_found",
+            "results": []
+        }
+
+    results = []
+    for row in rows:
+        results.append({
+            "filename": row["filename"],
+            "status": row["status"],
+            "data": row["extracted_data"] or {}
+        })
+
+    overall_status = "processing"
+    if all(r["status"] == "Success" for r in results):
+        overall_status = "success"
+    elif any(r["status"] == "Fail" for r in results):
+        overall_status = "fail"
+
+    return {
+        "jobId": job_id,
+        "status": overall_status,
+        "count": len(results),
+        "results": results
+    }
